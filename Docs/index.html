@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Firefly Carnival</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #050514;
+      color: #fff;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      height: 100%;
+      overflow: hidden;
+    }
+    /* 包一層只是為了居中，實際畫面由 canvas 撐滿 */
+    .wrap {
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #050514;
+    }
+    /* ★ 全螢幕：內部解析度仍是 640x480，CSS 放大到整個視窗 */
+    #gameCanvas {
+      width: 960px;
+      height: 720px;
+      background: #000;
+      display: block;
+      margin: auto;
+    }
+    #tip {
+      position: fixed;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.7);
+      padding: 8px 14px;
+      border-radius: 999px;
+      font-size: 14px;
+      z-index: 10;
+    }
+    #inputVideo {
+      display: none; /* 相機畫面不顯示，只用來給 MediaPipe */
+    }
+  </style>
+</head>
+<body>
+  <div id="tip">Click the page and allow camera & audio to start the game 🎮</div>
+  <div class="wrap">
+    <!-- 內部邏輯解析度仍是 640x480，CSS 會放大到全螢幕 -->
+    <canvas id="gameCanvas" width="640" height="480"></canvas>
+  </div>
+  <video id="inputVideo" playsinline></video>
+
+  <!-- MediaPipe Hands & Camera -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <script>
+  'use strict';
+
+  // ====== 基本參數 ======
+  const GAME_W = 640;
+  const GAME_H = 480;
+  const STATE_MENU = 0;
+  const STATE_GAME = 1;
+  const STATE_OVER = 2;
+
+  const NUM_FIREFLIES = 5;
+  const GAME_DURATION = 60; // 秒
+
+  const HAND_TARGET_W = 400;
+  const AVATAR_BOX_W  = 150;
+  const AVATAR_BOX_H  = 150;
+  const AVATAR_MARGIN = 12;
+  const FORBID_PADDING = 8;
+
+  // 糖果門檻
+  const CANDY_1_MAX = 10;
+  const CANDY_2_MAX = 20;
+  const CANDY_3_MIN = 21;
+  const CANDY_ALPHA_DIM = 0.35;
+
+  // ====== Canvas ======
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d');
+
+  // ====== 相機 / MediaPipe Hands ======
+  const videoElement = document.getElementById('inputVideo');
+  let hands;
+  let camera;
+  let cameraStarted = false;
+
+  let handX = null;
+  let handY = null;
+  let isPinching = false;
+
+  // ====== 遊戲狀態 ======
+  let state = STATE_MENU;
+  let fireflies = [];
+  let score = 0;
+  let startTime = 0;
+
+  // 禁入區（右上角小熊）
+  let avatarForbiddenRect = null;
+
+  // ====== 圖片 / 音效資源 ======
+  const img = {
+    bg: null,
+    avatar: null,
+    hand: null,
+    candy: null,
+    firefly: null,  // ★ 新增：螢火蟲 PNG
+  };
+
+  const audioUnlocked = { value: false };
+  let menuBgm, gameBgm, clickSfx, catchSfx;
+  let currentMusic = null;
+
+  // ====== 背景 pattern（避免閃爍：只隨機一次） ======
+  let starCache = null;
+  let bokehCache = null;
+
+  function initBackgroundPatterns() {
+    if (!starCache) {
+      starCache = [];
+      const nStars = 150;
+      for (let i=0;i<nStars;i++){
+        const x = Math.random()*(GAME_W-20)+10;
+        const y = Math.random()*(GAME_H*0.6-10)+10;
+        const r = Math.floor(Math.random()*2)+1;
+        starCache.push({x,y,r});
+      }
+    }
+    if (!bokehCache) {
+      bokehCache = [];
+      const nBokeh = 12;
+      for (let i=0;i<nBokeh;i++){
+        const x = Math.random()*GAME_W*0.8 + GAME_W*0.1;
+        const y = Math.random()*GAME_H*0.6 + 40;
+        const r = Math.random()*40 + 20;
+        const rC = Math.floor(Math.random()*105)+150;
+        const gC = Math.floor(Math.random()*105)+150;
+        const bC = Math.floor(Math.random()*105)+150;
+        bokehCache.push({x,y,r,rC,gC,bC});
+      }
+    }
+  }
+
+  // ====== 通用函式 ======
+  function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function rectsOverlap(r1, r2) {
+    if (!r1 || !r2) return false;
+    return !(r1.x2 <= r2.x1 || r1.x1 >= r2.x2 || r1.y2 <= r2.y1 || r1.y1 >= r2.y2);
+  }
+
+  // ====== Firefly 類別（改成使用 PNG + 光暈） ======
+  class Firefly {
+    constructor(w, h) {
+      this.w = w;
+      this.h = h;
+      this.radius = 20;
+      // ★ 速度較慢，適合小朋友
+      this.dx = (Math.random()*2 - 1) * 0.9; // -0.9 ~ 0.9
+      this.dy = (Math.random()*2 - 1) * 0.6; // -0.6 ~ 0.6
+      this.respawn();
+    }
+    respawn(forbidden=null) {
+      this.x = 30 + this.radius + Math.random()*(this.w - 60 - 2*this.radius);
+      this.y = 30 + this.radius + Math.random()*(this.h - 60 - 2*this.radius);
+      this.initialY = this.y;
+      this.avoidForbiddenOnSpawn(forbidden);
+    }
+    avoidForbiddenOnSpawn(forbidden) {
+      if (!forbidden) return;
+      const {x1,y1,x2,y2} = forbidden;
+      if (this.x >= x1 && this.x <= x2 && this.y >= y1 && this.y <= y2) {
+        this.x = clamp(x1 - this.radius - 10, this.radius+30, this.w - this.radius - 30);
+        this.y = clamp(this.y, this.radius+30, this.h  - this.radius - 30);
+        this.initialY = this.y;
+      }
+    }
+    move(forbidden=null) {
+      this.x += this.dx;
+      this.initialY += this.dy * 0.25;
+      this.y = this.initialY + Math.sin(Date.now()/500 + this.x*0.05) * 10;
+
+      if (this.x < this.radius+30 || this.x > this.w - this.radius - 30) {
+        this.dx *= -1;
+        this.x = clamp(this.x, this.radius+30, this.w - this.radius - 30);
+      }
+      if (this.y < this.radius+30 || this.y > this.h - this.radius - 30) {
+        this.dy *= -1;
+        this.y = clamp(this.y, this.radius+30, this.h - this.radius - 30);
+        this.initialY = this.y;
+      }
+
+      if (forbidden) {
+        const {x1,y1,x2,y2} = forbidden;
+        const me = { x1: this.x - this.radius, y1: this.y - this.radius,
+                     x2: this.x + this.radius, y2: this.y + this.radius };
+        if (rectsOverlap(me, forbidden)) {
+          const cx = this.x, cy = this.y;
+          const dL = Math.abs(cx - x1);
+          const dR = Math.abs(x2 - cx);
+          const dT = Math.abs(cy - y1);
+          const dB = Math.abs(y2 - cy);
+          const m = Math.min(dL,dR,dT,dB);
+          if (m===dL) {
+            this.x = x1 - this.radius - 1; this.dx = -Math.abs(this.dx);
+          } else if (m===dR) {
+            this.x = x2 + this.radius + 1; this.dx =  Math.abs(this.dx);
+          } else if (m===dT) {
+            this.y = y1 - this.radius - 1; this.dy = -Math.abs(this.dy); this.initialY = this.y;
+          } else {
+            this.y = y2 + this.radius + 1; this.dy =  Math.abs(this.dy); this.initialY = this.y;
+          }
+        }
+      }
+    }
+    draw(ctx) {
+      const t = Date.now()/120;
+      const blink = (Math.sin(t) + 1) * 0.5;
+
+      // 🔆 先畫一個黃光光暈（加亮模式）
+      const haloRadius = this.radius * 0.8;
+      const grad = ctx.createRadialGradient(
+        this.x, this.y,
+        haloRadius*0.1,
+        this.x, this.y,
+        haloRadius
+      );
+      grad.addColorStop(0, `rgba(255,240,120,0.6)`);
+      grad.addColorStop(1, `rgba(255,255,200,0)`);
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, haloRadius, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+
+      // 🐞 畫螢火蟲 PNG
+      if (img.firefly) {
+        // 依 radius 給一個大小，比較好控制
+        const baseW = this.radius * 6.0;
+        const scale = baseW / img.firefly.width;
+        const w = baseW;
+        const h = img.firefly.height * scale;
+        const x = this.x - w/2;
+        const y = this.y - h/2;
+        ctx.save();
+        // 稍微依 blink 讓亮度浮動一點（alpha在0.85~1之間）
+        ctx.globalAlpha = 0.85 + 0.15*blink;
+        ctx.drawImage(img.firefly, x, y, w, h);
+        ctx.restore();
+      } else {
+        // 萬一沒有 PNG，退回簡單畫圖版（黃色）
+        ctx.fillStyle = 'rgb(255, 230, 120)';
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.radius, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+    checkCollision(hx, hy) {
+      if (hx == null || hy == null) return false;
+      const cx = this.x;  // 撞擊中心改在 PNG 的中心
+      const cy = this.y;
+      const dx = cx - hx;
+      const dy = cy - hy;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      return dist < this.radius * 1.5;
+    }
+  }
+
+  // ====== MediaPipe Hands 設定 ======
+  function initHands() {
+    hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({
+      selfieMode: true,
+      maxNumHands: 1,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+      modelComplexity: 1,
+    });
+
+    hands.onResults((results) => {
+      const lm = results.multiHandLandmarks && results.multiHandLandmarks[0];
+      if (!lm) {
+        handX = handY = null;
+        isPinching = false;
+        return;
+      }
+
+      const tipIdx = [8, 12, 16, 20];
+      const pipIdx = [6, 10, 14, 18];
+      let curled = 0;
+      for (let i = 0; i < tipIdx.length; i++) {
+        const t = lm[tipIdx[i]];
+        const p = lm[pipIdx[i]];
+        const d = Math.hypot(t.x - p.x, t.y - p.y);
+        if (d < 0.1) curled++;
+      }
+      isPinching = curled >= 2;
+
+      const idx = lm[8];
+      handX = Math.floor(idx.x * GAME_W);
+      handY = Math.floor(idx.y * GAME_H);
+    });
+  }
+
+  async function startCameraOnce() {
+    if (cameraStarted) return;
+    cameraStarted = true;
+    try {
+      camera = new Camera(videoElement, {
+        onFrame: async () => {
+          await hands.send({image: videoElement});
+        },
+        width: GAME_W,
+        height: GAME_H
+      });
+      await camera.start();
+      console.log("Camera started");
+    } catch (e) {
+      console.error("Camera failed:", e);
+      alert("Camera failed: " + e.message);
+    }
+  }
+
+  // ====== 音效 ======
+  function loadAudio() {
+    menuBgm  = new Audio('menu_bg.mp3');
+    menuBgm.loop = true;
+    menuBgm.volume = 0.6;
+
+    gameBgm  = new Audio('game_bg.mp3');
+    gameBgm.loop = true;
+    gameBgm.volume = 0.6;
+
+    clickSfx = new Audio('button_click.wav');
+    catchSfx = new Audio('catch_sound.wav');
+  }
+
+  function playMusic(bgm) {
+    if (!audioUnlocked.value || !bgm) return;
+    if (currentMusic && currentMusic !== bgm) {
+      currentMusic.pause();
+      currentMusic.currentTime = 0;
+    }
+    currentMusic = bgm;
+    currentMusic.play().catch(()=>{});
+  }
+
+  function stopMusic() {
+    if (currentMusic) {
+      currentMusic.pause();
+      currentMusic.currentTime = 0;
+      currentMusic = null;
+    }
+  }
+
+  function startMusicFor(st) {
+    if (!audioUnlocked.value) return;
+    if (st === STATE_GAME) playMusic(gameBgm);
+    else playMusic(menuBgm);
+  }
+
+  function unlockOnce() {
+    if (audioUnlocked.value) return;
+    audioUnlocked.value = true;
+
+    const tipEl = document.getElementById('tip');
+    if (tipEl) tipEl.style.display = 'none';
+
+    startCameraOnce();
+    startMusicFor(state);
+  }
+
+  // ====== 圖片載入 ======
+  function loadImage(path) {
+    return new Promise((resolve) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = () => {
+        console.warn('Image load failed:', path);
+        resolve(null);
+      };
+      im.src = path;
+    });
+  }
+
+  async function loadAssets() {
+    img.bg      = await loadImage('background.jpg');
+    img.avatar  = await loadImage('avatar.jpg');
+    img.hand    = await loadImage('hand.png');
+    img.candy   = await loadImage('candy.png');
+    img.firefly = await loadImage('firefly.png');  // ★ 你的螢火蟲 PNG
+    loadAudio();
+    initBackgroundPatterns();
+  }
+
+  // ====== 畫面風格：背景與光 ======
+  function drawGradientBG() {
+    const top = [25,35,70];
+    const bottom = [10,10,35];
+    const h = GAME_H;
+    for (let y=0; y<h; y++){
+      const a = y/(h-1);
+      const r = Math.round((1-a)*top[2] + a*bottom[2]);
+      const g = Math.round((1-a)*top[1] + a*bottom[1]);
+      const b = Math.round((1-a)*top[0] + a*bottom[0]);
+      ctx.fillStyle = `rgb(${b},${g},${r})`;
+      ctx.fillRect(0,y,GAME_W,1);
+    }
+  }
+
+  function drawStarfieldFromCache() {
+    if (!starCache) return;
+    ctx.fillStyle = 'white';
+    for (const s of starCache){
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  function drawBokehFromCache() {
+    if (!bokehCache) return;
+    const overlay = document.createElement('canvas');
+    overlay.width = GAME_W;
+    overlay.height = GAME_H;
+    const octx = overlay.getContext('2d');
+    for (const b of bokehCache){
+      octx.fillStyle = `rgba(${b.rC},${b.gC},${b.bC},0.9)`;
+      octx.beginPath();
+      octx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+      octx.fill();
+    }
+    ctx.globalAlpha = 0.35;
+    ctx.drawImage(overlay,0,0);
+    ctx.globalAlpha = 1.0;
+  }
+
+  function drawMarqueeBorder(pad=10) {
+    const x1 = pad;
+    const y1 = pad;
+    const x2 = GAME_W - pad;
+    const y2 = GAME_H - pad;
+
+    ctx.fillStyle = 'rgba(50,30,80,0.5)';
+    ctx.fillRect(x1,y1,x2-x1,y2-y1);
+
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgb(80,60,130)';
+    ctx.strokeRect(x1,y1,x2-x1,y2-y1);
+
+    const step = 36;
+    const t = Date.now()/1000;
+    const phase = Math.floor(t*2) % step;  // 放慢一點
+
+    for (let x=x1+10; x<=x2-10; x+=step){
+      const idx = Math.floor(x/step + phase);
+      const col = (idx%2===0)? 'rgb(0,240,255)': 'rgb(0,120,200)';
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(x, y1+8, 5, 0, Math.PI*2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(x, y2-8, 5, 0, Math.PI*2);
+      ctx.fill();
+    }
+    for (let y=y1+10; y<=y2-10; y+=step){
+      const idx = Math.floor(y/step + phase);
+      const col = (idx%2===0)? 'rgb(0,240,255)': 'rgb(0,120,200)';
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(x1+8, y, 5, 0, Math.PI*2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(x2-8, y, 5, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  function neonText(text, centerY, scale, mainColor, glowColor, thickness) {
+    const fontSize = scale * 24;
+    ctx.font = `${fontSize}px "Segoe UI", system-ui`;
+    ctx.textBaseline = 'middle';
+    const metrics = ctx.measureText(text);
+    const x = (GAME_W - metrics.width)/2;
+    const y = centerY;
+
+    ctx.lineWidth = thickness + 6;
+    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+    ctx.strokeText(text, x+2, y+2);
+
+    ctx.lineWidth = thickness + 2;
+    ctx.strokeStyle = glowColor;
+    ctx.strokeText(text, x, y);
+
+    ctx.fillStyle = mainColor;
+    ctx.fillText(text, x, y);
+  }
+
+  function capsuleButton(text, centerY, width, height, color) {
+    const x = (GAME_W - width)/2;
+    const y = centerY - height/2;
+    ctx.fillStyle = `rgba(${color[0]},${color[1]},${color[2]},0.7)`;
+    ctx.beginPath();
+    const r = height/2;
+    ctx.moveTo(x+r,y);
+    ctx.lineTo(x+width-r,y);
+    ctx.arc(x+width-r,y+r,r,-Math.PI/2,Math.PI/2);
+    ctx.lineTo(x+r,y+height);
+    ctx.arc(x+r,y+r,r,Math.PI/2,Math.PI*1.5);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgb(120,100,200)';
+    ctx.stroke();
+
+    ctx.font = `18px "Segoe UI", system-ui`;
+    ctx.textBaseline = 'middle';
+    const m = ctx.measureText(text);
+    const tx = (GAME_W - m.width)/2;
+    const ty = centerY;
+    ctx.fillStyle = 'black';
+    ctx.fillText(text, tx+1, ty+1);
+    ctx.fillStyle = 'white';
+    ctx.fillText(text, tx, ty);
+  }
+
+  // ====== GAME HUD ======
+  function drawGameInfo(remaining) {
+    ctx.font = '20px "Segoe UI", system-ui';
+    ctx.textBaseline = 'alphabetic';
+
+    const tStr = `TIME: ${Math.max(0,Math.floor(remaining))}s`;
+    const sStr = `SCORE: ${score}`;
+
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(8,8, 180,60);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(tStr, 18, 32);
+    ctx.fillStyle = 'rgb(0,245,255)';
+    ctx.fillText(sStr, 18, 62);
+  }
+
+  // ====== 主選單 ======
+  function drawMenu() {
+    drawGradientBG();
+    drawStarfieldFromCache();
+    drawBokehFromCache();
+    drawMarqueeBorder(10);
+
+    neonText("FIREFLY CARNIVAL", 120, 2.0, "#ffffff", "rgb(0,140,255)", 4);
+    neonText("Curl your fingers to catch the fireflies!", 185, 0.9, "#ffffdd", "rgb(0,140,255)", 2);
+
+    capsuleButton("Press [S] to START GAME", 300, 420, 55, [80,60,150]);
+    capsuleButton("Press [Q] to QUIT",        360, 340, 50, [80,60,150]);
+  }
+
+  // ====== 右上角小熊 + 禁入區 ======
+  function drawAvatarBox() {
+    const x2 = GAME_W - AVATAR_MARGIN;
+    const x1 = x2 - AVATAR_BOX_W;
+    const y1 = AVATAR_MARGIN;
+    const y2 = AVATAR_MARGIN + AVATAR_BOX_H;
+
+    ctx.fillStyle = 'rgba(40,40,60,0.75)';
+    ctx.fillRect(x1,y1,x2-x1,y2-y1);
+
+    if (img.avatar) {
+      const aw = img.avatar.width;
+      const ah = img.avatar.height;
+      const maxW = AVATAR_BOX_W - 12;
+      const maxH = AVATAR_BOX_H - 12;
+      const s = Math.min(maxW/aw, maxH/ah);
+      const nw = aw*s;
+      const nh = ah*s;
+      const ox = x1 + (AVATAR_BOX_W - nw)/2;
+      const oy = y1 + (AVATAR_BOX_H - nh)/2;
+      ctx.drawImage(img.avatar, ox, oy, nw, nh);
+    }
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgb(200,200,230)';
+    ctx.strokeRect(x1,y1,x2-x1,y2-y1);
+
+    avatarForbiddenRect = {
+      x1: x1 - FORBID_PADDING,
+      y1: y1 - FORBID_PADDING,
+      x2: x2 + FORBID_PADDING,
+      y2: y2 + FORBID_PADDING
+    };
+  }
+
+  // ====== 結束畫面（糖果評分） ======
+  function drawCandyAt(cx, cy, alphaScale) {
+    if (!img.candy) return;
+    const targetW = 72;
+    const scale = targetW / img.candy.width;
+    const w = targetW;
+    const h = img.candy.height * scale;
+    const x = cx - w/2;
+    const y = cy - h/2;
+    ctx.save();
+    ctx.globalAlpha = alphaScale;
+    ctx.drawImage(img.candy, x,y,w,h);
+    ctx.restore();
+  }
+
+  function drawGameOver() {
+    drawGradientBG();
+    drawStarfieldFromCache();
+    drawBokehFromCache();
+    drawMarqueeBorder(10);
+
+    neonText("GOOD JOB!", 110, 1.6, "#ffffff", "rgb(255,215,0)", 5);
+    neonText(`YOU CAUGHT ${score} FIREFLIES`, 170, 1.1, "#e0ffff", "rgb(0,140,255)", 4);
+
+    let candies = 1;
+    let msg = "Nice start! Try again!";
+    if (score >= CANDY_3_MIN) {
+      candies = 3;
+      msg = "Excellent coordination!";
+    } else if (score > CANDY_1_MAX && score <= CANDY_2_MAX) {
+      candies = 2;
+      msg = "Great effort, keep going!";
+    }
+
+    neonText(msg, 230, 0.9, "#ffffff", "rgb(71,99,255)", 2);
+
+    const centers = [
+      {x: GAME_W/2 - 120, y: 310},
+      {x: GAME_W/2,       y: 310},
+      {x: GAME_W/2 + 120, y: 310},
+    ];
+    for (let i=0;i<3;i++){
+      drawCandyAt(centers[i].x, centers[i].y, i < candies ? 1.0 : CANDY_ALPHA_DIM);
+    }
+
+    capsuleButton("Press [R] to RESTART", GAME_H - 100, 360, 46, [80,60,150]);
+    capsuleButton("Press [Q] to HOME",    GAME_H - 50,  320, 46, [80,60,150]);
+  }
+
+  // ====== 遊戲背景（進行中） ======
+  function drawGameBackground() {
+    if (img.bg) {
+      ctx.drawImage(img.bg,0,0,GAME_W,GAME_H);
+    } else {
+      drawGradientBG();
+      drawStarfieldFromCache();
+      drawBokehFromCache();
+    }
+  }
+
+  // ====== 手圖 ======
+  function drawHandSprite() {
+    if (!img.hand || handX === null || handY === null) return;
+    const scale = HAND_TARGET_W / img.hand.width;
+    const w = HAND_TARGET_W;
+    const h = img.hand.height * scale;
+    const x = handX - w/2;
+    const y = handY - h/2;
+    ctx.drawImage(img.hand, x, y, w, h);
+  }
+
+  // ====== 主迴圈 ======
+  let lastTime = performance.now();
+
+  function loop(now) {
+    lastTime = now;
+
+    if (state === STATE_MENU) {
+      drawMenu();
+
+    } else if (state === STATE_GAME) {
+      drawGameBackground();
+
+      const elapsed = (performance.now() - startTime)/1000;
+      const remaining = GAME_DURATION - elapsed;
+      if (remaining <= 0) {
+        state = STATE_OVER;
+        stopMusic();
+        startMusicFor(state);
+      } else {
+        drawAvatarBox();
+
+        for (let i=0;i<fireflies.length;i++){
+          fireflies[i].move(avatarForbiddenRect);
+        }
+        for (let i=0;i<fireflies.length;i++){
+          fireflies[i].draw(ctx);
+        }
+
+        drawHandSprite();
+
+        if (isPinching && handX !== null && handY !== null) {
+          for (let i=fireflies.length-1; i>=0; i--){
+            if (fireflies[i].checkCollision(handX, handY)) {
+              score++;
+              if (catchSfx && audioUnlocked.value) {
+                catchSfx.currentTime=0;
+                catchSfx.play().catch(()=>{});
+              }
+              fireflies.splice(i,1);
+            }
+          }
+        }
+
+        while (fireflies.length < NUM_FIREFLIES) {
+          const f = new Firefly(GAME_W,GAME_H);
+          f.avoidForbiddenOnSpawn(avatarForbiddenRect);
+          fireflies.push(f);
+        }
+
+        drawGameInfo(remaining);
+      }
+
+    } else if (state === STATE_OVER) {
+      drawGameOver();
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  // ====== 遊戲狀態轉換 ======
+  function startNewGame() {
+    score = 0;
+    fireflies = [];
+    for (let i=0;i<NUM_FIREFLIES;i++){
+      fireflies.push(new Firefly(GAME_W,GAME_H));
+    }
+    startTime = performance.now();
+    state = STATE_GAME;
+    startMusicFor(state);
+  }
+
+  function goToMenu() {
+    state = STATE_MENU;
+    startMusicFor(state);
+  }
+
+  // ====== 鍵盤控制 ======
+  document.addEventListener('keydown', (ev)=>{
+    const key = ev.key.toLowerCase();
+    if (state === STATE_MENU) {
+      if (key === 's') {
+        if (clickSfx && audioUnlocked.value) { clickSfx.currentTime=0; clickSfx.play().catch(()=>{}); }
+        startNewGame();
+      } else if (key === 'q') {
+        window.close?.();
+      }
+    } else if (state === STATE_GAME) {
+      if (key === 'q') {
+        goToMenu();
+      }
+    } else if (state === STATE_OVER) {
+      if (key === 'r') {
+        if (clickSfx && audioUnlocked.value) { clickSfx.currentTime=0; clickSfx.play().catch(()=>{}); }
+        goToMenu();
+      } else if (key === 'q') {
+        goToMenu();
+      }
+    }
+  });
+
+  // ====== 使用者點一下 → 解鎖相機＋音樂 ======
+  document.addEventListener('pointerdown', unlockOnce, {once:true});
+  document.addEventListener('keydown', unlockOnce, {once:true});
+
+  // ====== 初始化 ======
+  (async function main(){
+    initHands();
+    await loadAssets();
+    lastTime = performance.now();
+    requestAnimationFrame(loop);
+  })();
+
+  </script>
+</body>
+</html>
