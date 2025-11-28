@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-Hant">
 <head>
   <meta charset="UTF-8" />
-  <title>Firefly Carnival</title>
+  <title>螢火蟲冒險</title>
   <style>
     html, body {
       margin: 0;
@@ -47,7 +47,7 @@
   </style>
 </head>
 <body>
-  <div id="tip">Click the page and allow camera & audio to start the game 🎮</div>
+  <div id="tip">點擊畫面並允許相機與音訊即可開始遊戲 🎮</div>
   <div class="wrap">
     <!-- 內部邏輯解析度仍是 640x480，CSS 會放大到全螢幕 -->
     <canvas id="gameCanvas" width="640" height="480"></canvas>
@@ -331,7 +331,7 @@
       console.log("Camera started");
     } catch (e) {
       console.error("Camera failed:", e);
-      alert("Camera failed: " + e.message);
+      alert("相機啟動失敗： " + e.message);
     }
   }
 
@@ -544,11 +544,11 @@
     ctx.font = '20px "Segoe UI", system-ui';
     ctx.textBaseline = 'alphabetic';
 
-    const tStr = `TIME: ${Math.max(0,Math.floor(remaining))}s`;
-    const sStr = `SCORE: ${score}`;
+    const tStr = `時間: ${Math.max(0,Math.floor(remaining))} 秒`;
+    const sStr = `分數: ${score}`;
 
     ctx.fillStyle = 'rgba(0,0,0,0.7)';
-    ctx.fillRect(8,8, 180,60);
+    ctx.fillRect(8,8, 200,60);
 
     ctx.fillStyle = '#ffffff';
     ctx.fillText(tStr, 18, 32);
@@ -563,11 +563,11 @@
     drawBokehFromCache();
     drawMarqueeBorder(10);
 
-    neonText("FIREFLY CARNIVAL", 120, 2.0, "#ffffff", "rgb(0,140,255)", 4);
-    neonText("Curl your fingers to catch the fireflies!", 185, 0.9, "#ffffdd", "rgb(0,140,255)", 2);
+    neonText("螢火蟲冒險", 120, 2.0, "#ffffff", "rgb(0,140,255)", 4);
+    neonText("舉起你的手，一起來抓螢火蟲吧！", 185, 0.9, "#ffffdd", "rgb(0,140,255)", 2);
 
-    capsuleButton("Press [S] to START GAME", 300, 420, 55, [80,60,150]);
-    capsuleButton("Press [Q] to QUIT",        360, 340, 50, [80,60,150]);
+    capsuleButton("按下 [S] 開始遊戲", 300, 420, 55, [80,60,150]);
+    capsuleButton("按下 [Q] 結束遊戲", 360, 340, 50, [80,60,150]);
   }
 
   // ====== 右上角小熊 + 禁入區 ======
@@ -625,17 +625,17 @@
     drawBokehFromCache();
     drawMarqueeBorder(10);
 
-    neonText("GOOD JOB!", 110, 1.6, "#ffffff", "rgb(255,215,0)", 5);
-    neonText(`YOU CAUGHT ${score} FIREFLIES`, 170, 1.1, "#e0ffff", "rgb(0,140,255)", 4);
+    neonText("太棒了！", 110, 1.6, "#ffffff", "rgb(255,127,36)", 5);
+    neonText(`你抓到了 ${score} 隻螢火蟲`, 170, 1.1, "#e0ffff", "rgb(0,140,255)", 4);
 
     let candies = 1;
-    let msg = "Nice start! Try again!";
+    let msg = "不錯的開始，再試一次！";
     if (score >= CANDY_3_MIN) {
       candies = 3;
-      msg = "Excellent coordination!";
+      msg = "手眼協調超厲害！";
     } else if (score > CANDY_1_MAX && score <= CANDY_2_MAX) {
       candies = 2;
-      msg = "Great effort, keep going!";
+      msg = "表現很棒，繼續加油！";
     }
 
     neonText(msg, 230, 0.9, "#ffffff", "rgb(71,99,255)", 2);
@@ -649,8 +649,8 @@
       drawCandyAt(centers[i].x, centers[i].y, i < candies ? 1.0 : CANDY_ALPHA_DIM);
     }
 
-    capsuleButton("Press [R] to RESTART", GAME_H - 100, 360, 46, [80,60,150]);
-    capsuleButton("Press [Q] to HOME",    GAME_H - 50,  320, 46, [80,60,150]);
+    capsuleButton("按下 [R] 再玩一次", GAME_H - 100, 360, 46, [80,60,150]);
+    capsuleButton("按下 [Q] 回到主選單", GAME_H - 50,  320, 46, [80,60,150]);
   }
 
   // ====== 遊戲背景（進行中） ======
